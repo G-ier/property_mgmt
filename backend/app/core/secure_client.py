@@ -6,7 +6,10 @@ This module provides secure database access with automatic tenant filtering
 import logging
 from typing import Any, Dict, List, Optional
 from ..database import supabase
+from ..config import settings
+from .database_pool import DatabasePool
 from .tenant_context import get_tenant_id
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +55,10 @@ class SecureClient:
             return query
     
     @staticmethod
-    async def get_properties(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    async def get_properties(filters: Optional[Dict[str, Any]] = None,
+                             tenant_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get properties with tenant isolation"""
-        tenant_id = get_tenant_id()
+        tenant_id = tenant_id or get_tenant_id()
         
         if not tenant_id:
             logger.warning("No tenant_id in context - returning empty list")
@@ -63,6 +67,24 @@ class SecureClient:
         logger.info(f"SecureClient.get_properties for tenant: {tenant_id}")
         
         try:
+            # The local challenge database has no PostgREST service. Use the
+            # same tenant-scoped SQL connection as the revenue query there.
+            if not (settings.supabase_url and settings.supabase_service_role_key):
+                db_pool = DatabasePool()
+                await db_pool.initialize()
+                try:
+                    async with db_pool.get_session() as session:
+                        result = await session.execute(
+                            text("""
+                                SELECT id, name, timezone FROM properties
+                                WHERE tenant_id = :tenant_id ORDER BY name, id
+                            """),
+                            {"tenant_id": tenant_id},
+                        )
+                        return [dict(row) for row in result.mappings().all()]
+                finally:
+                    await db_pool.close()
+
             query = supabase.table('properties').select('*')
             query = SecureClient._apply_tenant_filter(query, tenant_id, 'properties')
             
@@ -85,7 +107,7 @@ class SecureClient:
             
         except Exception as e:
             logger.error(f"Error fetching properties: {str(e)}")
-            return []
+            raise
     
     @staticmethod
     async def get_reservations(filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
